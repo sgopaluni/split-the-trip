@@ -1,0 +1,85 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  function verified() { return request.auth != null && request.auth.token.email_verified == true; }
+  function email() { return request.auth.token.email.lower(); }
+  function trip(t) { return get(/databases/$(database)/documents/trips/$(t)).data; }
+  function member(t) { return verified() && email() in trip(t).memberEmails; }
+  function owner(t) { return member(t) && trip(t).ownerEmail == email(); }
+  function amount(n) { return n is int && n >= 0 && n <= 100000000000; }
+  function slot(m, ids, i) { return ids.size() > i ? m.get(ids[i], 0) : 0; }
+  function validSlot(m, ids, i) { return amount(slot(m, ids, i)); }
+  function allocation(m, ids, total) {
+   return m is map && m.keys().hasOnly(ids)
+    && validSlot(m,ids,0) && validSlot(m,ids,1) && validSlot(m,ids,2) && validSlot(m,ids,3)
+    && validSlot(m,ids,4) && validSlot(m,ids,5) && validSlot(m,ids,6) && validSlot(m,ids,7)
+    && validSlot(m,ids,8) && validSlot(m,ids,9) && validSlot(m,ids,10) && validSlot(m,ids,11)
+    && slot(m,ids,0)+slot(m,ids,1)+slot(m,ids,2)+slot(m,ids,3)+slot(m,ids,4)+slot(m,ids,5)
+     +slot(m,ids,6)+slot(m,ids,7)+slot(m,ids,8)+slot(m,ids,9)+slot(m,ids,10)+slot(m,ids,11) == total;
+  }
+  function validTrip(d) {
+   return d.keys().hasOnly(['name','destination','startDate','endDate','currency','budget','members','memberEmails','ownerEmail','archived','createdAt','updatedAt','createdBy','version'])
+    && d.name is string && d.name.size() > 0 && d.name.size() <= 100
+    && d.destination is string && d.destination.size() <= 120
+    && d.currency == 'USD' && amount(d.budget) && d.archived is bool
+    && d.startDate is string && d.endDate is string && d.startDate <= d.endDate
+    && d.members is list && d.memberEmails is list && d.memberEmails.size() > 0 && d.memberEmails.size() <= 12
+    && d.memberEmails.toSet().size() == d.memberEmails.size() && d.members.size() == d.memberEmails.size()
+    && d.ownerEmail in d.memberEmails;
+  }
+  function validExpense(d,t) {
+   return d.keys().hasOnly(['title','amount','originalAmount','originalCurrency','rate','paid','originalPaid','shares','splitMode','splitValues','category','date','note','receiptUrl','recurrence','createdAt','updatedAt','createdBy','version'])
+    && d.title is string && d.title.size() > 0 && d.title.size() <= 120
+    && amount(d.amount) && d.amount > 0 && d.originalAmount == d.amount && d.originalCurrency == 'USD' && d.rate == 1
+    && d.note is string && d.note.size() <= 2000 && d.receiptUrl is string && d.receiptUrl.size() <= 2000
+    && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+    && d.category in ['food','stay','transport','flights','groceries','activities','shopping','entertainment','health','utilities','insurance','gifts','other']
+    && d.splitMode in ['equal','exact','percent','shares'] && d.recurrence in ['none','weekly','monthly']
+    && allocation(d.paid,trip(t).memberEmails,d.amount) && allocation(d.shares,trip(t).memberEmails,d.amount);
+  }
+  match /trips/{t} {
+   allow read: if verified() && email() in resource.data.memberEmails;
+   allow create: if verified() && validTrip(request.resource.data) && request.resource.data.ownerEmail == email() && request.resource.data.createdBy == email() && request.resource.data.version == 1;
+   allow update: if owner(t) && validTrip(request.resource.data)
+    && request.resource.data.ownerEmail == resource.data.ownerEmail && request.resource.data.currency == resource.data.currency
+    && request.resource.data.memberEmails.hasAll(resource.data.memberEmails)
+    && request.resource.data.createdBy == resource.data.createdBy && request.resource.data.createdAt == resource.data.createdAt
+    && request.resource.data.version == resource.data.version + 1;
+   allow delete: if false;
+   match /expenses/{e} {
+    allow read: if member(t);
+    allow create: if member(t) && validExpense(request.resource.data,t) && request.resource.data.createdBy == email() && request.resource.data.version == 1;
+    allow update: if member(t) && validExpense(request.resource.data,t)
+     && request.resource.data.createdBy == resource.data.createdBy && request.resource.data.createdAt == resource.data.createdAt
+     && request.resource.data.version == resource.data.version + 1;
+    allow delete: if member(t);
+   }
+   match /settlements/{s} {
+    allow read: if member(t);
+    allow create: if member(t) && request.resource.data.keys().hasOnly(['from','to','amount','note','date','status','createdAt','updatedAt','createdBy','version'])
+     && request.resource.data.from in trip(t).memberEmails && request.resource.data.to in trip(t).memberEmails
+     && request.resource.data.from != request.resource.data.to && email() in [request.resource.data.from,request.resource.data.to]
+     && request.resource.data.createdBy == email() && request.resource.data.version == 1 && request.resource.data.status == 'pending'
+     && amount(request.resource.data.amount) && request.resource.data.amount > 0
+     && request.resource.data.note is string && request.resource.data.note.size() <= 500
+     && request.resource.data.date is string && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    allow update: if member(t) && resource.data.status == 'pending'
+     && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt','version'])
+     && request.resource.data.version == resource.data.version + 1
+     && ((email() == resource.data.createdBy && request.resource.data.status == 'cancelled')
+      || (email() != resource.data.createdBy && email() in [resource.data.from,resource.data.to] && request.resource.data.status in ['confirmed','rejected']));
+    allow delete: if false;
+   }
+   match /comments/{c} {
+    allow read: if member(t);
+    allow create: if member(t) && request.resource.data.keys().hasOnly(['expenseId','text','createdAt','updatedAt','createdBy','version'])
+     && request.resource.data.createdBy == email() && request.resource.data.version == 1
+     && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 2000
+     && request.resource.data.expenseId is string
+     && exists(/databases/$(database)/documents/trips/$(t)/expenses/$(request.resource.data.expenseId));
+    allow update: if false;
+    allow delete: if member(t) && resource.data.createdBy == email();
+   }
+  }
+ }
+}
